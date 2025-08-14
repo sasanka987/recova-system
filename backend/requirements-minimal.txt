@@ -1,0 +1,7 @@
+# Minimal requirements that should work on any Windows system
+fastapi
+uvicorn
+sqlalchemy
+pymysql
+pydantic
+python-multipart

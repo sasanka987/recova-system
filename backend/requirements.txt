@@ -1,0 +1,31 @@
+# Core FastAPI
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+sqlalchemy==2.0.23
+mysql-connector-python==8.2.0
+
+# Authentication & Security (Windows-friendly versions)
+PyJWT==2.8.0
+passlib==1.7.4
+bcrypt==4.1.2
+python-multipart==0.0.6
+
+# Settings management
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# File processing
+pillow==10.1.0
+openpyxl==3.1.2
+
+# File handling
+aiofiles==23.2.1
+
+# We'll add these later when needed:
+# redis==5.0.1
+# celery==5.3.4
+# aiosmtplib==3.0.1
+# python-socketio==5.10.0
+# alembic==1.13.1
