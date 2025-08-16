@@ -1,48 +1,62 @@
+# app/api/api_v1/endpoints/customers.py
+import math
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, and_, func
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 
 from app.db.database import get_db
 from app.api.api_v1.endpoints.auth import get_current_user
 from app.models.user import User
 from app.models.customer import Customer
-from app.schemas.customer import CustomerResponse
+from app.schemas.customer import CustomerResponse, CustomerCreate, CustomerUpdate, CustomerDetailResponse
+from decimal import Decimal
 
 router = APIRouter()
 
 
-@router.get("/test-no-auth")
-async def test_without_auth():
-    """Test endpoint that doesn't require authentication"""
-    return {
-        "message": "This endpoint works without authentication!",
-        "status": "success",
-        "timestamp": datetime.now().isoformat()
-    }
+def serialize_customer(customer):
+    """Helper function to serialize customer data, handling NaN and None values"""
+    data = {}
+    for column in customer.__table__.columns:
+        value = getattr(customer, column.name)
 
+        # Handle Decimal types
+        if isinstance(value, Decimal):
+            # Convert Decimal to float, handling None
+            data[column.name] = float(value) if value is not None else None
+        # Handle float types with NaN check
+        elif isinstance(value, float):
+            # Check for NaN or Infinity
+            if math.isnan(value) or math.isinf(value):
+                data[column.name] = None
+            else:
+                data[column.name] = value
+        # Handle datetime
+        elif hasattr(value, 'isoformat'):
+            data[column.name] = value.isoformat()
+        else:
+            data[column.name] = value
 
-@router.get("/test-auth-simple")
-async def test_auth_simple(current_user: User = Depends(get_current_user)):
-    """Simple auth test - just return user info"""
-    return {
-        "message": "Authentication working!",
-        "user_email": current_user.email,
-        "user_id": current_user.id,
-        "user_status": current_user.status,
-        "success": True
-    }
+    return data
 
-
-@router.get("/", response_model=List[CustomerResponse])
+@router.get("/")
 async def get_customers(
-        skip: int = Query(0, ge=0),
-        limit: int = Query(100, ge=1, le=1000),
+        skip: int = Query(0, ge=0, description="Number of records to skip"),
+        limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
         search: Optional[str] = Query(None, description="Search by name, NIC, or contract number"),
+        zone: Optional[str] = Query(None, description="Filter by zone"),
+        region: Optional[str] = Query(None, description="Filter by region"),
+        branch: Optional[str] = Query(None, description="Filter by branch"),
+        min_arrears: Optional[int] = Query(None, description="Minimum days in arrears"),
+        max_arrears: Optional[int] = Query(None, description="Maximum days in arrears"),
+        sort_by: Optional[str] = Query("created_at", description="Sort by field"),
+        sort_order: Optional[str] = Query("desc", description="Sort order (asc/desc)"),
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Get list of customers with filtering and search"""
+    """Get list of customers with advanced filtering and search"""
 
     query = db.query(Customer)
 
@@ -50,96 +64,294 @@ async def get_customers(
     if search:
         search_term = f"%{search}%"
         query = query.filter(
-            (Customer.client_name.like(search_term)) |
-            (Customer.nic.like(search_term)) |
-            (Customer.contract_number.like(search_term))
+            or_(
+                Customer.client_name.ilike(search_term),
+                Customer.nic.ilike(search_term),
+                Customer.contract_number.ilike(search_term),
+                Customer.work_place_name.ilike(search_term),
+                Customer.postal_town.ilike(search_term)
+            )
         )
 
+    # Apply location filters
+    if zone:
+        query = query.filter(Customer.zone == zone)
+    if region:
+        query = query.filter(Customer.region == region)
+    if branch:
+        query = query.filter(Customer.branch_name == branch)
+
+    # Apply arrears filters
+    if min_arrears is not None:
+        query = query.filter(Customer.days_in_arrears >= min_arrears)
+    if max_arrears is not None:
+        query = query.filter(Customer.days_in_arrears <= max_arrears)
+
+    # Apply sorting
+    if hasattr(Customer, sort_by):
+        order_column = getattr(Customer, sort_by)
+        if sort_order.lower() == "desc":
+            query = query.order_by(order_column.desc())
+        else:
+            query = query.order_by(order_column.asc())
+
+    # Get total count before pagination
+    total_count = query.count()
+
+    # Apply pagination
     customers = query.offset(skip).limit(limit).all()
-    return customers
+
+    # Serialize customers properly
+    serialized_customers = []
+    for customer in customers:
+        serialized_customers.append(serialize_customer(customer))
+
+    return serialized_customers
 
 
-@router.get("/{customer_id}", response_model=CustomerResponse)
-async def get_customer(
+@router.get("/statistics")
+async def get_customer_statistics(
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Get customer statistics for dashboard"""
+
+    total_customers = db.query(Customer).count()
+
+    # Arrears statistics
+    arrears_stats = {
+        "current": db.query(Customer).filter(
+            or_(Customer.days_in_arrears == 0, Customer.days_in_arrears.is_(None))
+        ).count(),
+        "1_30_days": db.query(Customer).filter(
+            and_(Customer.days_in_arrears > 0, Customer.days_in_arrears <= 30)
+        ).count(),
+        "31_60_days": db.query(Customer).filter(
+            and_(Customer.days_in_arrears > 30, Customer.days_in_arrears <= 60)
+        ).count(),
+        "61_90_days": db.query(Customer).filter(
+            and_(Customer.days_in_arrears > 60, Customer.days_in_arrears <= 90)
+        ).count(),
+        "over_90_days": db.query(Customer).filter(Customer.days_in_arrears > 90).count()
+    }
+
+    # Zone distribution
+    zone_distribution = db.query(
+        Customer.zone,
+        func.count(Customer.id).label('count')
+    ).group_by(Customer.zone).all()
+
+    # Total outstanding amount - handle None values
+    total_outstanding = db.query(
+        func.sum(Customer.granted_amount)
+    ).scalar()
+
+    # Average days in arrears - handle None values
+    avg_arrears = db.query(
+        func.avg(Customer.days_in_arrears)
+    ).scalar()
+
+    return {
+        "total_customers": total_customers,
+        "arrears_breakdown": arrears_stats,
+        "zone_distribution": [
+            {"zone": zone or "Unknown", "count": count}
+            for zone, count in zone_distribution
+        ],
+        "total_outstanding_amount": float(total_outstanding) if total_outstanding else 0,
+        "average_days_in_arrears": float(avg_arrears) if avg_arrears else 0
+    }
+
+
+@router.get("/filters")
+async def get_filter_options(
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Get available filter options for dropdowns"""
+
+    zones = db.query(Customer.zone).distinct().filter(Customer.zone.isnot(None)).all()
+    regions = db.query(Customer.region).distinct().filter(Customer.region.isnot(None)).all()
+    branches = db.query(Customer.branch_name).distinct().filter(Customer.branch_name.isnot(None)).all()
+
+    return {
+        "zones": [z[0] for z in zones if z[0]],
+        "regions": [r[0] for r in regions if r[0]],
+        "branches": [b[0] for b in branches if b[0]]
+    }
+
+
+@router.get("/{customer_id}", response_model=CustomerDetailResponse)
+async def get_customer_detail(
         customer_id: int,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Get specific customer by ID"""
+    """Get detailed customer information"""
 
     customer = db.query(Customer).filter(Customer.id == customer_id).first()
 
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
 
+    # You can add related data here (payments, remarks, etc.)
+    # For now, returning the customer data
     return customer
 
 
-@router.post("/create-test-data")
-async def create_test_customers(
+@router.put("/{customer_id}", response_model=CustomerResponse)
+async def update_customer(
+        customer_id: int,
+        customer_update: CustomerUpdate,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Create some test customers for testing (temporary endpoint)"""
+    """Update customer information"""
 
-    test_customers = [
-        {
-            "client_name": "John Doe",
-            "nic": "123456789V",
-            "home_address": "123 Main Street, Colombo 03",
-            "contract_number": "CC001234567",
-            "granted_amount": 500000.00,
-            "zone": "Colombo",
-            "region": "Western",
-            "branch_name": "Colombo Central",
-            "days_in_arrears": 15,
-            "customer_contact_number_1": "0771234567"
-        },
-        {
-            "client_name": "Jane Smith",
-            "nic": "987654321V",
-            "home_address": "456 Oak Road, Kandy",
-            "contract_number": "LN987654321",
-            "granted_amount": 1000000.00,
-            "zone": "Kandy",
-            "region": "Central",
-            "branch_name": "Kandy Main",
-            "days_in_arrears": 30,
-            "customer_contact_number_1": "0712345678"
-        },
-        {
-            "client_name": "Mike Johnson",
-            "nic": "456789123V",
-            "home_address": "789 Beach Road, Galle",
-            "contract_number": "LS456789123",
-            "granted_amount": 750000.00,
-            "zone": "Galle",
-            "region": "Southern",
-            "branch_name": "Galle Fort",
-            "days_in_arrears": 5,
-            "customer_contact_number_1": "0723456789"
-        }
-    ]
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
 
-    created_customers = []
-    for customer_data in test_customers:
-        try:
-            # Check if customer already exists
-            existing = db.query(Customer).filter(Customer.nic == customer_data["nic"]).first()
-            if not existing:
-                customer = Customer(**customer_data)
-                db.add(customer)
-                created_customers.append(customer_data["client_name"])
-        except Exception as e:
-            print(f"Error creating customer {customer_data['client_name']}: {e}")
-            continue
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Update only provided fields
+    update_data = customer_update.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(customer, field, value)
+
+    customer.updated_at = datetime.utcnow()
 
     db.commit()
+    db.refresh(customer)
 
-    return {
-        "message": f"Created {len(created_customers)} test customers",
-        "customers": created_customers,
-        "total_customers": len(test_customers),
-        "note": "You can now test the /customers/ endpoint to see the data",
-        "success": True
-    }
+    return customer
+
+
+@router.post("/", response_model=CustomerResponse)
+async def create_customer(
+        customer_data: CustomerCreate,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Create a new customer manually"""
+
+    # Check if customer with same NIC already exists
+    existing = db.query(Customer).filter(Customer.nic == customer_data.nic).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Customer with NIC {customer_data.nic} already exists"
+        )
+
+    # Check if contract number already exists
+    existing_contract = db.query(Customer).filter(
+        Customer.contract_number == customer_data.contract_number
+    ).first()
+    if existing_contract:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Contract number {customer_data.contract_number} already exists"
+        )
+
+    customer = Customer(**customer_data.dict())
+    customer.created_by = current_user.id
+
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+
+    return customer
+
+
+@router.delete("/{customer_id}")
+async def delete_customer(
+        customer_id: int,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Delete a customer (soft delete recommended in production)"""
+
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Check user permissions (only directors or managers should delete)
+    # For now, we'll allow any authenticated user
+
+    db.delete(customer)
+    db.commit()
+
+    return {"message": "Customer deleted successfully"}
+
+
+@router.get("/export/csv")
+async def export_customers_csv(
+        search: Optional[str] = None,
+        zone: Optional[str] = None,
+        region: Optional[str] = None,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Export filtered customers to CSV"""
+
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    query = db.query(Customer)
+
+    # Apply same filters as listing
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            or_(
+                Customer.client_name.ilike(search_term),
+                Customer.nic.ilike(search_term),
+                Customer.contract_number.ilike(search_term)
+            )
+        )
+
+    if zone:
+        query = query.filter(Customer.zone == zone)
+    if region:
+        query = query.filter(Customer.region == region)
+
+    customers = query.all()
+
+    # Create CSV in memory
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Write headers
+    writer.writerow([
+        'ID', 'Client Name', 'NIC', 'Contract Number', 'Zone', 'Region',
+        'Branch', 'Days in Arrears', 'Granted Amount', 'Contact Number',
+        'Work Place', 'Home Address'
+    ])
+
+    # Write data
+    for customer in customers:
+        writer.writerow([
+            customer.id,
+            customer.client_name,
+            customer.nic,
+            customer.contract_number,
+            customer.zone,
+            customer.region,
+            customer.branch_name,
+            customer.days_in_arrears,
+            customer.granted_amount,
+            customer.customer_contact_number_1,
+            customer.work_place_name,
+            customer.home_address
+        ])
+
+    output.seek(0)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type='text/csv',
+        headers={
+            "Content-Disposition": f"attachment; filename=customers_export_{date.today()}.csv"
+        }
+    )

@@ -1,3 +1,4 @@
+# app/schemas/import_batch.py
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -25,7 +26,7 @@ class ImportBatchResponse(BaseModel):
     id: int
     batch_name: str
     bank_name: str
-    operation_type: ImportStatusEnum  # This will need to be fixed
+    operation_type: OperationTypeEnum  # Fixed: Changed from ImportStatusEnum to OperationTypeEnum
     import_period: str
     file_name: str
     file_size: int
@@ -46,3 +47,18 @@ class UploadResponse(BaseModel):
     file_name: str
     file_size: int
     next_step: str
+
+
+class ImportErrorResponse(BaseModel):
+    id: int
+    batch_id: int
+    row_number: int
+    column_name: Optional[str] = None
+    error_type: str
+    error_message: str
+    original_value: Optional[str] = None
+    suggested_value: Optional[str] = None
+    is_critical: bool
+
+    class Config:
+        from_attributes = True
