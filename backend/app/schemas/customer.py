@@ -1,14 +1,17 @@
-# app/schemas/customer.py
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, validator
 from typing import Optional
 from datetime import date, datetime
 from decimal import Decimal
 
 
 class CustomerBase(BaseModel):
+    # Client and Contract (THE KEY CHANGE!)
+    client_id: int
+    contract_number: str
+
+    # Personal Information
     client_name: str
     nic: str
-    contract_number: str
     home_address: Optional[str] = None
 
     # Contact Information
@@ -45,14 +48,12 @@ class CustomerBase(BaseModel):
     details: Optional[str] = None
     payment_assumption: Optional[str] = None
 
-    # Guarantor 1 Information
+    # Guarantor Information
     guarantor_1_name: Optional[str] = None
     guarantor_1_address: Optional[str] = None
     guarantor_1_nic: Optional[str] = None
     guarantor_1_contact_number_1: Optional[str] = None
     guarantor_1_contact_number_2: Optional[str] = None
-
-    # Guarantor 2 Information
     guarantor_2_name: Optional[str] = None
     guarantor_2_address: Optional[str] = None
     guarantor_2_nic: Optional[str] = None
@@ -62,13 +63,18 @@ class CustomerBase(BaseModel):
     @validator('nic')
     def validate_nic(cls, v):
         if v:
-            # Sri Lankan NIC validation
             v = v.strip().upper()
-            # Old format: 9 digits + V/X or New format: 12 digits
+            # Sri Lankan NIC validation: 9 digits + V/X or 12 digits
             if not ((len(v) == 10 and v[:-1].isdigit() and v[-1] in 'VX') or
                     (len(v) == 12 and v.isdigit())):
                 raise ValueError('Invalid NIC format')
         return v
+
+    @validator('contract_number')
+    def validate_contract_number(cls, v):
+        if not v or len(v.strip()) == 0:
+            raise ValueError('Contract number cannot be empty')
+        return v.strip()
 
 
 class CustomerCreate(CustomerBase):
@@ -76,7 +82,9 @@ class CustomerCreate(CustomerBase):
 
 
 class CustomerUpdate(BaseModel):
-    # All fields optional for updates
+    # Allow updating most fields except client_id and contract_number
+    client_name: Optional[str] = None
+    nic: Optional[str] = None
     home_address: Optional[str] = None
     customer_contact_number_1: Optional[str] = None
     customer_contact_number_2: Optional[str] = None
@@ -84,8 +92,6 @@ class CustomerUpdate(BaseModel):
     work_place_name: Optional[str] = None
     work_place_address: Optional[str] = None
     work_place_contact_number_1: Optional[str] = None
-    work_place_contact_number_2: Optional[str] = None
-    work_place_contact_number_3: Optional[str] = None
     payment_assumption: Optional[str] = None
     details: Optional[str] = None
     days_in_arrears: Optional[int] = None
@@ -95,9 +101,10 @@ class CustomerUpdate(BaseModel):
 
 class CustomerResponse(BaseModel):
     id: int
+    client_id: int
+    contract_number: str
     client_name: str
     nic: str
-    contract_number: str
     home_address: Optional[str] = None
     customer_contact_number_1: Optional[str] = None
     zone: Optional[str] = None
@@ -111,6 +118,9 @@ class CustomerResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    # Include client information
+    client: Optional[dict] = None
+
     class Config:
         from_attributes = True
 
@@ -121,13 +131,8 @@ class CustomerDetailResponse(CustomerBase):
     updated_at: datetime
     import_batch_id: Optional[int] = None
 
+    # Include full client information
+    client: Optional[dict] = None
+
     class Config:
         from_attributes = True
-
-
-class CustomerStatistics(BaseModel):
-    total_customers: int
-    arrears_breakdown: dict
-    zone_distribution: list
-    total_outstanding_amount: float
-    average_days_in_arrears: float

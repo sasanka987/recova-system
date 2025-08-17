@@ -1,3 +1,6 @@
+# app/core/config.py
+import os
+
 from pydantic_settings import BaseSettings
 from typing import Optional
 
@@ -8,16 +11,23 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "RECOVA"
 
     # Database Settings
-    MYSQL_SERVER: str = "localhost"
-    MYSQL_USER: str = "root"
-    MYSQL_PASSWORD: str = "0147"  # Set your MySQL password here
-    MYSQL_DB: str = "recova_db"
+    #MYSQL_SERVER: str = "localhost"
+    #MYSQL_USER: str = "root"
+    #MYSQL_PASSWORD: str = "0147"  # Set your MySQL password here
+    #MYSQL_DB: str = "recova_db"
+    #DATABASE_URL: Optional[str] = None
+
+    # Database
+    MYSQL_SERVER: str = os.getenv("MYSQL_SERVER", "localhost")
+    MYSQL_USER: str = os.getenv("MYSQL_USER", "root")
+    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "0147") # Set your MySQL password here
+    MYSQL_DB: str = os.getenv("MYSQL_DB", "recova_db")
     DATABASE_URL: Optional[str] = None
 
     # Security Settings
     SECRET_KEY: str = "your-secret-key-change-this-in-production"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 8  # 8 hours
 
     # Redis Settings
     REDIS_HOST: str = "localhost"
@@ -43,6 +53,14 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        case_sensitive = True
 
 
 settings = Settings()
+
+# Debug print to verify configuration
+if __name__ == "__main__":
+    print("Configuration loaded:")
+    print(f"MYSQL_SERVER: {settings.MYSQL_SERVER}")
+    print(f"MYSQL_DB: {settings.MYSQL_DB}")
+    print(f"API_V1_STR: {settings.API_V1_STR}")

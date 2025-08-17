@@ -1,8 +1,10 @@
+# app/db/init_db.py - FIXED IMPORTS
 from sqlalchemy import text
 from app.db.database import engine, SessionLocal
 from app.models import *  # Import all models
 from app.models.role import Role
 from app.models.user import User
+from app.models.remark_abbreviation import RemarkAbbreviation  # FIXED: Import from correct file
 from app.core.security import get_password_hash
 
 
@@ -108,8 +110,69 @@ def init_db() -> None:
                 db.add(director_user)
                 db.commit()
 
+            # Initialize default remark abbreviations
+            init_default_remark_abbreviations(db)
+
     except Exception as e:
         print(f"Error initializing database: {e}")
         db.rollback()
     finally:
         db.close()
+
+
+def init_default_remark_abbreviations(db):
+    """Initialize default remark abbreviations"""
+
+    default_abbreviations = [
+        {"abbreviation": "LMG", "description": "Left Message",
+         "detailed_description": "Left message with family member or colleague"},
+        {"abbreviation": "RNR", "description": "Ringing No Response",
+         "detailed_description": "Phone ringing but no one answered"},
+        {"abbreviation": "PTP", "description": "Promise to Pay",
+         "detailed_description": "Customer promised to make payment"},
+        {"abbreviation": "SW", "description": "Switched Off", "detailed_description": "Phone is switched off"},
+        {"abbreviation": "OOR", "description": "Out of Reach", "detailed_description": "Phone out of network coverage"},
+        {"abbreviation": "CBL", "description": "Call Back Later",
+         "detailed_description": "Customer requested to call back later"},
+        {"abbreviation": "DNC", "description": "Disputed - Not Contacted",
+         "detailed_description": "Customer disputes the debt"},
+        {"abbreviation": "WN", "description": "Wrong Number", "detailed_description": "Contact number is incorrect"},
+        {"abbreviation": "NA", "description": "No Answer", "detailed_description": "No response to calls"},
+        {"abbreviation": "NHV", "description": "Not at Home - Visited",
+         "detailed_description": "Customer not at home during visit"},
+        {"abbreviation": "MET", "description": "Met Customer",
+         "detailed_description": "Successfully met with customer"},
+        {"abbreviation": "ADD", "description": "Address Not Found",
+         "detailed_description": "Could not locate customer address"},
+        {"abbreviation": "REF", "description": "Refused to Pay",
+         "detailed_description": "Customer refused to make payment"},
+        {"abbreviation": "PAR", "description": "Partial Payment",
+         "detailed_description": "Customer made partial payment"},
+        {"abbreviation": "FUL", "description": "Full Payment", "detailed_description": "Customer made full payment"},
+    ]
+
+    # Get director user for created_by
+    director_user = db.query(User).filter(User.email == "director@sapl.lk").first()
+    if not director_user:
+        print("Warning: No director user found for remark abbreviations")
+        return
+
+    for abbr_data in default_abbreviations:
+        existing = db.query(RemarkAbbreviation).filter(
+            RemarkAbbreviation.abbreviation == abbr_data["abbreviation"]
+        ).first()
+
+        if not existing:
+            abbreviation = RemarkAbbreviation(
+                **abbr_data,
+                is_system_default=True,
+                created_by=director_user.id
+            )
+            db.add(abbreviation)
+
+    db.commit()
+
+
+if __name__ == "__main__":
+    init_db()
+    print("Database initialized successfully!")

@@ -1,12 +1,12 @@
-# app/api/api_v1/endpoints/imports.py
+# backend/app/api/api_v1/endpoints/imports.py - ULTIMATE COMPLETE VERSION
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from datetime import datetime, date
 import os
 import shutil
-from datetime import datetime
 import pandas as pd
 import hashlib
 
@@ -15,6 +15,7 @@ from app.api.api_v1.endpoints.auth import get_current_user
 from app.models.user import User
 from app.models.import_batch import ImportBatch, ImportError, OperationType, ImportStatus
 from app.models.customer import Customer
+from app.models.client import Client
 from app.schemas.import_batch import ImportBatchResponse, UploadResponse
 
 router = APIRouter()
@@ -23,14 +24,21 @@ router = APIRouter()
 @router.post("/upload", response_model=UploadResponse)
 async def upload_import_file(
         file: UploadFile = File(...),
-        bank_name: str = Form(...),
+        client_id: int = Form(...),  # NEW: Require client selection
         operation_type: str = Form(...),
-        import_period: str = Form(...),  # e.g., "August 2025"
-        bank_code: Optional[str] = Form(None),
+        import_period: str = Form(...),
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Upload Excel file for import processing"""
+    """Upload Excel file for import processing with client-based system"""
+
+    # Verify client exists
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Client with ID {client_id} not found"
+        )
 
     # Validate file type
     if not file.filename.endswith(('.xlsx', '.xls')):
@@ -51,14 +59,14 @@ async def upload_import_file(
     upload_dir = "uploads/imports"
     os.makedirs(upload_dir, exist_ok=True)
 
-    # Generate unique filename
+    # Generate unique filename with client code
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_extension = os.path.splitext(file.filename)[1]
-    safe_bank_name = bank_name.replace(" ", "_").replace("/", "_")
+    safe_client_code = client.client_code.replace(" ", "_").replace("/", "_")
     safe_operation = operation_type.replace("_", "-")
     safe_period = import_period.replace(" ", "_")
 
-    unique_filename = f"{safe_bank_name}_{safe_operation}_{safe_period}_{timestamp}{file_extension}"
+    unique_filename = f"{safe_client_code}_{safe_operation}_{safe_period}_{timestamp}{file_extension}"
     file_path = os.path.join(upload_dir, unique_filename)
 
     # Save uploaded file
@@ -91,9 +99,10 @@ async def upload_import_file(
         file_hash = hashlib.md5(content).hexdigest()
 
         batch = ImportBatch(
-            batch_name=f"{bank_name} {operation_type} {import_period}",
-            bank_name=bank_name,
-            bank_code=bank_code,
+            batch_name=f"{client.client_code} {operation_type} {import_period}",
+            client_id=client_id,  # Store client ID
+            bank_name=client.client_name,  # Keep for backward compatibility
+            bank_code=client.client_code,
             operation_type=OperationType(operation_type),
             import_period=import_period,
             import_month=month,
@@ -134,7 +143,7 @@ async def validate_import_batch(
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Validate uploaded import file"""
+    """Validate uploaded import file with client code validation"""
 
     batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
     if not batch:
@@ -165,13 +174,14 @@ async def validate_import_batch(
 
         # Required fields based on operation type
         required_fields = {
-            "CREDIT_CARD": ["client_name", "nic", "contract_number"],
-            "LOAN": ["client_name", "nic", "contract_number"],
-            "LEASING": ["client_name", "nic", "contract_number"],
-            "PAYMENT": ["payment_date", "contract_number", "payment_amount"]
+            "CREDIT_CARD": ["client_code", "client_name", "nic", "contract_number"],
+            "LOAN": ["client_code", "client_name", "nic", "contract_number"],
+            "LEASING": ["client_code", "client_name", "nic", "contract_number"],
+            "PAYMENT": ["client_code", "payment_date", "contract_number", "payment_amount"]
         }
 
-        required = required_fields.get(batch.operation_type.value, ["client_name", "nic", "contract_number"])
+        required = required_fields.get(batch.operation_type.value,
+                                       ["client_code", "client_name", "nic", "contract_number"])
 
         # Check required columns exist
         missing_columns = [col for col in required if col not in df.columns]
@@ -183,6 +193,9 @@ async def validate_import_batch(
                 "error_message": f"Missing required columns: {missing_columns}",
                 "is_critical": True
             })
+
+        # Get the client for this batch to validate client codes
+        batch_client = db.query(Client).filter(Client.id == batch.client_id).first()
 
         # Validate each row
         for index, row in df.iterrows():
@@ -200,6 +213,19 @@ async def validate_import_batch(
                         "is_critical": True
                     })
 
+            # Validate client code matches the selected client
+            if 'client_code' in df.columns and not pd.isna(row['client_code']):
+                client_code = str(row['client_code']).strip()
+                if client_code != batch_client.client_code:
+                    row_errors.append({
+                        "row_number": index + 2,
+                        "column_name": "client_code",
+                        "error_type": "INVALID_CLIENT_CODE",
+                        "error_message": f"Client code '{client_code}' doesn't match selected client '{batch_client.client_code}'",
+                        "original_value": client_code,
+                        "is_critical": True
+                    })
+
             # Validate NIC format if present
             if 'nic' in df.columns and not pd.isna(row['nic']):
                 nic = str(row['nic']).strip()
@@ -212,6 +238,20 @@ async def validate_import_batch(
                         "error_message": "Invalid NIC format. Use 123456789V or 123456789012",
                         "original_value": nic,
                         "is_critical": False
+                    })
+
+            # Check for duplicate contract numbers within this file
+            if 'contract_number' in df.columns and not pd.isna(row['contract_number']):
+                contract_number = str(row['contract_number']).strip()
+                duplicate_count = df[df['contract_number'] == contract_number].shape[0]
+                if duplicate_count > 1:
+                    row_errors.append({
+                        "row_number": index + 2,
+                        "column_name": "contract_number",
+                        "error_type": "DUPLICATE_CONTRACT_IN_FILE",
+                        "error_message": f"Contract number '{contract_number}' appears {duplicate_count} times in this file",
+                        "original_value": contract_number,
+                        "is_critical": True
                     })
 
             # If no critical errors, count as valid
@@ -270,7 +310,7 @@ async def process_import_batch(
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Process validated import batch and import data - FIXED VERSION"""
+    """Process validated import batch with client-based customer management"""
 
     batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
     if not batch:
@@ -321,25 +361,25 @@ async def process_import_batch(
                     else:
                         row_data[col] = None
 
-                # IMPORTANT: Check if customer exists by CONTRACT_NUMBER (not NIC)
+                # Get contract number
                 contract_number = row_data.get('contract_number')
-
                 if not contract_number:
                     print(f"Row {index}: No contract number found, skipping")
                     continue
 
-                # Find existing customer by contract_number
+                # Check if customer exists for this client and contract
                 existing_customer = db.query(Customer).filter(
+                    Customer.client_id == batch.client_id,
                     Customer.contract_number == contract_number
                 ).first()
 
                 if existing_customer:
                     # UPDATE existing customer
-                    print(f"Updating customer with contract {contract_number}")
+                    print(f"Updating customer with contract {contract_number} for client {batch.client_id}")
 
                     # Update all fields from the import
                     for key, value in row_data.items():
-                        if hasattr(existing_customer, key) and value is not None:
+                        if hasattr(existing_customer, key) and value is not None and key != 'client_code':
                             setattr(existing_customer, key, value)
 
                     # Update import batch ID and timestamp
@@ -349,11 +389,12 @@ async def process_import_batch(
                     updated_count += 1
                 else:
                     # CREATE new customer
-                    print(f"Creating new customer with contract {contract_number}")
+                    print(f"Creating new customer with contract {contract_number} for client {batch.client_id}")
 
                     # Filter only valid Customer model fields
                     customer_fields = [col.name for col in Customer.__table__.columns]
                     customer_data = {k: v for k, v in row_data.items() if k in customer_fields}
+                    customer_data['client_id'] = batch.client_id  # Set client ID
                     customer_data['import_batch_id'] = batch_id
                     customer_data['created_by'] = current_user.id
 
@@ -406,12 +447,18 @@ async def process_import_batch(
 async def get_import_batches(
         skip: int = 0,
         limit: int = 50,
+        client_id: Optional[int] = None,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
 ):
-    """Get list of import batches"""
+    """Get list of import batches with optional client filtering"""
 
-    batches = db.query(ImportBatch).order_by(ImportBatch.created_at.desc()).offset(skip).limit(limit).all()
+    query = db.query(ImportBatch).order_by(ImportBatch.created_at.desc())
+
+    if client_id:
+        query = query.filter(ImportBatch.client_id == client_id)
+
+    batches = query.offset(skip).limit(limit).all()
     return batches
 
 
@@ -502,95 +549,9 @@ async def get_import_status(
         "completed_at": batch.import_completed_at,
         "bank_name": batch.bank_name,
         "operation_type": batch.operation_type.value,
-        "import_period": batch.import_period
+        "import_period": batch.import_period,
+        "client_id": batch.client_id
     }
-
-
-# Add this debug endpoint to your imports.py file temporarily
-
-@router.post("/process-debug/{batch_id}")
-async def process_import_batch_debug(
-        batch_id: int,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
-):
-    """Debug version of process import to see what's happening"""
-
-    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
-    if not batch:
-        raise HTTPException(status_code=404, detail="Import batch not found")
-
-    debug_info = {
-        "batch_info": {
-            "id": batch.id,
-            "name": batch.batch_name,
-            "file": batch.file_name,
-            "status": batch.status.value
-        },
-        "file_exists": os.path.exists(batch.file_path),
-        "file_path": batch.file_path,
-        "rows_processed": [],
-        "errors": []
-    }
-
-    try:
-        # Read Excel file
-        df = pd.read_excel(batch.file_path, engine='openpyxl')
-
-        # Show original columns
-        debug_info["original_columns"] = list(df.columns)
-
-        # Clean column names
-        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
-        debug_info["cleaned_columns"] = list(df.columns)
-
-        # Show first few rows of data
-        debug_info["sample_data"] = df.head().to_dict('records')
-        debug_info["total_rows"] = len(df)
-
-        # Check for required columns
-        required = ["client_name", "nic", "contract_number"]
-        debug_info["required_columns_present"] = {col: col in df.columns for col in required}
-
-        # Process first 5 rows for debugging
-        for index, row in df.head().iterrows():
-            row_info = {
-                "row_index": index,
-                "contract_number": row.get('contract_number'),
-                "nic": row.get('nic'),
-                "client_name": row.get('client_name')
-            }
-
-            # Check if contract exists
-            if pd.notna(row.get('contract_number')):
-                contract_number = str(row['contract_number']).strip()
-                existing = db.query(Customer).filter(
-                    Customer.contract_number == contract_number
-                ).first()
-                row_info["contract_exists"] = existing is not None
-                if existing:
-                    row_info["existing_customer_id"] = existing.id
-
-            debug_info["rows_processed"].append(row_info)
-
-        # Check Customer table
-        total_customers = db.query(Customer).count()
-        recent_customers = db.query(Customer).filter(
-            Customer.import_batch_id == batch_id
-        ).count()
-
-        debug_info["customer_table"] = {
-            "total_customers": total_customers,
-            "from_this_batch": recent_customers
-        }
-
-        return debug_info
-
-    except Exception as e:
-        debug_info["errors"].append(str(e))
-        import traceback
-        debug_info["traceback"] = traceback.format_exc()
-        return debug_info
 
 
 @router.get("/check-customers/{batch_id}")
@@ -616,12 +577,14 @@ async def check_imported_customers(
         "batch_status": batch.status.value,
         "imported_records": batch.imported_records,
         "customers_found": len(customers),
+        "client_id": batch.client_id,
         "customer_list": [
             {
                 "id": c.id,
                 "client_name": c.client_name,
                 "nic": c.nic,
                 "contract_number": c.contract_number,
+                "client_id": c.client_id,
                 "created_at": c.created_at
             }
             for c in customers
@@ -629,7 +592,26 @@ async def check_imported_customers(
     }
 
 
-# Add this simple test endpoint to your imports.py
+@router.post("/force-reprocess/{batch_id}")
+async def force_reprocess_batch(
+        batch_id: int,
+        db: Session = Depends(get_db),
+        current_user: User = Depends(get_current_user)
+):
+    """Force reprocess a batch regardless of status"""
+
+    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Import batch not found")
+
+    # Reset status to VALIDATED to allow reprocessing
+    batch.status = ImportStatus.VALIDATED
+    batch.imported_records = 0
+    db.commit()
+
+    # Now process it
+    return await process_import_batch(batch_id, db, current_user)
+
 
 @router.get("/test-import-status")
 async def test_import_status(
@@ -664,6 +646,7 @@ async def test_import_status(
             "total_records": batch.total_records,
             "imported_records": batch.imported_records,
             "customers_in_db": customers_count,
+            "client_id": batch.client_id,
             "sample_customers": [
                 {
                     "id": c.id,
@@ -677,24 +660,3 @@ async def test_import_status(
         result["recent_batches"].append(batch_info)
 
     return result
-
-
-@router.post("/force-reprocess/{batch_id}")
-async def force_reprocess_batch(
-        batch_id: int,
-        db: Session = Depends(get_db),
-        current_user: User = Depends(get_current_user)
-):
-    """Force reprocess a batch regardless of status"""
-
-    batch = db.query(ImportBatch).filter(ImportBatch.id == batch_id).first()
-    if not batch:
-        raise HTTPException(status_code=404, detail="Import batch not found")
-
-    # Reset status to VALIDATED to allow reprocessing
-    batch.status = ImportStatus.VALIDATED
-    batch.imported_records = 0
-    db.commit()
-
-    # Now process it
-    return await process_import_batch(batch_id, db, current_user)
